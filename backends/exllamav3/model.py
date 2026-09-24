@@ -179,7 +179,12 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.4.7")
+        # LOCAL DEVIATION (2026-09-12): upstream requires >= 1.4.7; the sm75
+        # fork (rluisr sm75-dev @ 9f811ba, base dev@843725c) reports 1.4.6.
+        # Only known gap vs mainline here: SS_DRY (shimmed to None in
+        # venv-sm75's sampler __init__). If exotic sampler paths fail under
+        # venv-sm75, suspect remaining 1.4.7-1.4.9 API drift.
+        check_package_version("exllamav3", "1.4.6")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
