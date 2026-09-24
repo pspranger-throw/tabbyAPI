@@ -17,11 +17,13 @@ class CompletionTokensDetails(BaseModel):
     OpenAI-style completion token details. Speculative decoding is reported in the
     Predicted Outputs fields: draft tokens the model confirmed or discarded. Both are
     0 without a draft model. completion_tokens counts only emitted tokens, so rejected
-    drafts are never double counted.
+    drafts are never double counted. reasoning_tokens is the thinking subset of
+    completion_tokens (approximate at phase boundaries within a streamed chunk).
     """
 
     accepted_prediction_tokens: int = 0
     rejected_prediction_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 class UsageStats(BaseModel):

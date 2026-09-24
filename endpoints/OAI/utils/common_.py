@@ -34,6 +34,7 @@ def get_usage_stats(
         completion_tokens_details=CompletionTokensDetails(
             accepted_prediction_tokens=generation.get("draft_accept") or 0,
             rejected_prediction_tokens=generation.get("draft_reject") or 0,
+            reasoning_tokens=generation.get("thinking_tokens") or 0,
         ),
         completion_time=generation.get("gen_time"),
         completion_tokens_per_sec=generation.get("gen_tokens_per_sec"),
@@ -71,6 +72,9 @@ def aggregate_usage_stats(usage_stats_list: list[UsageStats]) -> UsageStats:
             ),
             rejected_prediction_tokens=sum(
                 us.completion_tokens_details.rejected_prediction_tokens for us in usl
+            ),
+            reasoning_tokens=sum(
+                us.completion_tokens_details.reasoning_tokens for us in usl
             ),
         ),
         completion_time=completion_time,

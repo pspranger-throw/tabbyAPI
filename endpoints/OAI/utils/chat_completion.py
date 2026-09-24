@@ -698,6 +698,7 @@ async def _chat_stream_collector(
             )
             budget_injection = None
     reasoning_tokens = 0
+    thinking_tokens = 0.0
 
     # Collect logprobs
     collected_logprobs = []
@@ -726,15 +727,29 @@ async def _chat_stream_collector(
 
             delta_reasoning = ""
             delta_content = ""
+            chunk_thinking_chars = 0
             for channel, sub in events:
                 if channel == REASONING:
                     delta_reasoning += sub
                     full_reasoning += sub
+                    chunk_thinking_chars += len(sub)
                 elif channel == CONTENT:
                     delta_content += sub
                     full_content += sub
                 else:
                     full_tool += sub
+
+            # Thinking/visible token split for metrics (deviation #2): attribute
+            # the chunk's tokens to channels proportionally to their character
+            # share of the parser-emitted span, so the finish chunk carries a
+            # running thinking token count alongside gen_tokens. Attribution is
+            # approximate at phase boundaries within a chunk (same class of
+            # approximation as the reasoning-budget counter above).
+            chunk_token_count = len(generation.get("token_ids") or [])
+            if chunk_token_count:
+                chunk_chars = sum(len(sub) for _, sub in events) or 1
+                thinking_tokens += chunk_token_count * chunk_thinking_chars / chunk_chars
+            generation["thinking_tokens"] = round(thinking_tokens)
 
             # Count reasoning tokens and force the end of the reasoning phase
             # when the budget is exhausted. Attribution is approximate: a
