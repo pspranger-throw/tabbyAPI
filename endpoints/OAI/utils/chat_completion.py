@@ -4,7 +4,7 @@ import asyncio
 import json
 import pathlib
 from asyncio import CancelledError
-from time import time
+from time import monotonic, time
 from typing import List, Optional
 from fastapi import HTTPException, Request
 from jinja2 import TemplateError
@@ -241,6 +241,40 @@ def _compose_serialize_stream_chunk(
     # Check if no data
     is_empty = not delta and not progress and not (finish_reason and not suppress_finish)
     return s, data, finish_reason, is_empty
+
+
+# Empty-delta heartbeat cadence for silent-but-productive stream spans (today:
+# buffered tool-call text). While generation events keep arriving but nothing
+# has been streamable for this long, emit a heartbeat frame so downstream
+# progress counters don't flag a stall. A producer that goes genuinely quiet
+# never reaches the heartbeat branch, so hang detection stays with the
+# client's/gateway's stall cap.
+STREAM_HEARTBEAT_INTERVAL_S = 30.0
+
+
+def _compose_serialize_stream_heartbeat(
+    request_id: str,
+    choice_index: int,
+    model_name: Optional[str] = None,
+) -> str:
+    """
+    Compose a minimal empty-delta stream chunk: SSE progress for spans where
+    tokens are being generated but nothing is streamable yet (tool-call text is
+    buffered until finish). Carries no finish_reason and no usage, so it is
+    pure stream churn that clients ignore.
+    """
+
+    data = {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion.chunk",
+        "created": int(time()),
+        "choices": [{"index": choice_index, "delta": {}, "finish_reason": None}],
+    }
+
+    if model_name:
+        data["model"] = model_name
+
+    return json.dumps(data, ensure_ascii=False)
 
 
 def _compose_serialize_stream_usage_chunk(
@@ -913,6 +947,8 @@ async def stream_generate_chat_completion(
             gen_tasks.append(gen_task)
 
         # Consumer loop
+        last_yield_at = monotonic()
+        last_choice_index = 0
         while True:
             generation = await gen_queue.get()
 
@@ -926,6 +962,9 @@ async def stream_generate_chat_completion(
             timings = get_timings(generation) if data.n == 1 else None
             suppress_finish = return_usage and remaining_n == 1
 
+            if generation.get("index") is not None:
+                last_choice_index = generation["index"]
+
             # Create and serialize chunk
             chunk, _, finish_reason, is_empty = _compose_serialize_stream_chunk(
                 request.state.id,
@@ -935,7 +974,25 @@ async def stream_generate_chat_completion(
                 None if suppress_finish else timings,
             )
             if not is_empty:
+                last_yield_at = monotonic()
                 yield chunk
+            elif (
+                not finish_reason
+                and monotonic() - last_yield_at >= STREAM_HEARTBEAT_INTERVAL_S
+            ):
+                # Tokens are arriving but nothing has been streamable for a
+                # full interval (e.g. buffered tool-call span): keep the SSE
+                # channel visibly alive. Empty deltas are standard stream
+                # churn; the gateway's data-line progress counter needs them
+                # because tool spans otherwise emit zero frames. Never fires
+                # on the suppressed terminal frame (finish_reason set) nor
+                # after a quiet producer (the loop is parked in get() then),
+                # so the gateway's runaway stall cap stays the hang detector.
+                # Invariant: interval << runaway_stall_cap_s (30 vs 120 today).
+                last_yield_at = monotonic()
+                yield _compose_serialize_stream_heartbeat(
+                    request.state.id, last_choice_index, model_path.name
+                )
 
             # Send usage chunk on completing last choice
             if finish_reason:
