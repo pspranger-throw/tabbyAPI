@@ -139,7 +139,10 @@ def log_metrics(
     total_time = metrics.get("total_time") or (queue_time + prompt_time + gen_time)
 
     # Generation
+    thinking_tokens = metrics.get("thinking_tokens") or 0
     generated = f"{gen_tokens:,} tokens generated"
+    if thinking_tokens:
+        generated += f" ({thinking_tokens:,} thinking)"
     if isinstance(gen_ts, (int, float)):
         generated += f" at {gen_ts:,.1f} T/s"
     sections = [generated]
@@ -190,6 +193,7 @@ def log_metrics(
             "prompt_time": prompt_time,
             "prompt_tokens_per_second": metrics.get("prompt_tokens_per_sec"),
             "gen_tokens": gen_tokens,
+            "thinking_tokens": thinking_tokens,
             "gen_time": gen_time,
             "gen_tokens_per_second": gen_ts,
             "queue_time": queue_time,
