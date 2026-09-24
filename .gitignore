@@ -216,3 +216,6 @@ openapi.json
 
 # Backup files
 *.bak
+
+# Local build venv (restructure B1 target location)
+venv-sm75-v150/
