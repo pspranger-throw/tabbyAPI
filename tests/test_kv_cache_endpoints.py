@@ -10,10 +10,16 @@ pre-signed P3 rig drills):
 * `GET /v1/cache/status`: drill-assertable restore + last-save records (no log-grep).
 * Eager load-time restore is exception-isolated fail-closed-to-COLD (G4) and quarantines a
   rejected set (`*.rejected-<ts>`) instead of deleting it.
+
+Async style follows tests/test_context_length_errors.py (`unittest.IsolatedAsyncioTestCase` —
+the suite runs without a pytest async plugin).
 """
 
 import asyncio
 import os
+import shutil
+import tempfile
+import unittest
 
 import pytest
 
@@ -94,220 +100,230 @@ def make_container(generator = None):
     return container
 
 
-@pytest.fixture
-def kv_config(tmp_path, monkeypatch):
-    kv = KvSaveConfig(store_dir = str(tmp_path / "session"), stash_budget_mb = 256)
-    monkeypatch.setattr(config, "kv_save", kv)
-    return kv
+class _KvCaseBase(unittest.IsolatedAsyncioTestCase):
+    """Temp store + global config/container patching, restored on teardown."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix = "kvsave-p2-test-")
+        self.store = os.path.join(self.tmp, "session")
+        self._prev_kv = config.kv_save
+        self._prev_container = model_module.container
+
+    def tearDown(self):
+        config.kv_save = self._prev_kv
+        model_module.container = self._prev_container
+        shutil.rmtree(self.tmp, ignore_errors = True)
+
+    def configure(self, store = True, budget = 256):
+        config.kv_save = KvSaveConfig(
+            store_dir = self.store if store else None, stash_budget_mb = budget
+        )
+
+    def unconfigure(self):
+        config.kv_save = KvSaveConfig()
 
 
-@pytest.fixture
-def kv_unconfigured(monkeypatch):
-    monkeypatch.setattr(config, "kv_save", KvSaveConfig())
-    return config.kv_save
+class KvSavePolicyTests(_KvCaseBase):
+    async def test_not_configured_refuses_and_keeps_set(self):
+        self.unconfigure()
+        gen = FakeGenerator()
+        container = make_container(gen)
+        code, record = await container.kv_save()
+        self.assertEqual(code, 422)
+        self.assertEqual(record["status"], "refused")
+        self.assertIn("not configured", record["reason"])
+        self.assertEqual(gen.save_calls, [])
+
+    async def test_no_generator_refuses_and_keeps_set(self):
+        self.configure()
+        container = make_container(None)
+        code, record = await container.kv_save()
+        self.assertEqual(code, 422)
+        self.assertEqual(record["status"], "refused")
+        self.assertIn("no generator", record["reason"])
+
+    async def test_latched_generator_refuses_and_keeps_set(self):
+        self.configure()
+        gen = FakeGenerator()
+        gen.error = RuntimeError("latched")
+        container = make_container(gen)
+        code, record = await container.kv_save()
+        self.assertEqual(code, 422)
+        self.assertEqual(record["status"], "refused")
+        self.assertIn("latched", record["reason"])
+        self.assertEqual(gen.save_calls, [])
+
+    async def test_busy_skips_immediately_without_waiting(self):
+        self.configure()
+        gen = FakeGenerator(save_delay = 5.0)
+        container = make_container(gen)
+        container.active_job_ids["req-1"] = object()
+        code, record = await container.kv_save()
+        self.assertEqual(code, 409)
+        self.assertEqual(record["status"], "busy")
+        self.assertIn("1 active job", record["reason"])
+        self.assertEqual(gen.save_calls, [], "D12: a busy save must not queue a snapshot")
+
+    async def test_saved_200_carries_d8_observability(self):
+        self.configure(budget = 256)
+        gen = FakeGenerator()
+        container = make_container(gen)
+        code, record = await container.kv_save()
+        self.assertEqual(code, 200)
+        self.assertEqual(record["status"], "saved")
+        self.assertEqual(record["n_pages"], 512)
+        self.assertEqual(record["n_stashes"], 4)
+        self.assertEqual(record["bytes"], 3145728 + 2048 + 262144)
+        self.assertIsNotNone(record["save_ms"])
+        self.assertGreaterEqual(record["save_ms"], 0)
+        self.assertEqual(record["store_dir"], self.store)
+        self.assertEqual(gen.save_calls, [(self.store, 256)],
+                         "store + configured stash budget must be passed")
+        self.assertEqual(container.kv_status()["last_save"]["status"], "saved")
+
+    async def test_zero_stash_is_skipped_not_dead_set(self):
+        """User decision 2026-09-24: zero-stash saves = skip + loud log, no dead sets."""
+        self.configure()
+        gen = FakeGenerator(save_result = {
+            "dir": None, "skipped": "zero-stash", "n_pages": 3, "n_stashes": 0,
+            "stash_keys": [], "checks": None, "meta": None, "deepest_anchor_page_idx": -1,
+        })
+        container = make_container(gen)
+        code, record = await container.kv_save()
+        self.assertEqual(code, 422)
+        self.assertEqual(record["status"], "skipped")
+        self.assertEqual(record["reason"], "zero-stash")
+        self.assertEqual(record["n_pages"], 3)
+        self.assertEqual(record["n_stashes"], 0)
+        self.assertEqual(container.kv_status()["last_save"]["reason"], "zero-stash")
+
+    async def test_engine_exception_is_definitive_failure(self):
+        self.configure()
+        gen = FakeGenerator(save_error = RuntimeError("io exploded"))
+        container = make_container(gen)
+        code, record = await container.kv_save()
+        self.assertEqual(code, 500)
+        self.assertEqual(record["status"], "error")
+        self.assertIn("io exploded", record["reason"])
+
+    async def test_save_timeout_is_definitive_failure(self):
+        self.configure()
+        gen = FakeGenerator(save_delay = 5.0)
+        container = make_container(gen)
+        container.KV_SAVE_TIMEOUT_S = 0.05
+        code, record = await container.kv_save()
+        self.assertEqual(code, 504)
+        self.assertEqual(record["status"], "error")
+        self.assertIn("timed out", record["reason"])
+
+    async def test_save_endpoint_maps_status_codes(self):
+        self.configure()
+        gen = FakeGenerator(save_error = RuntimeError("boom"))
+        model_module.container = make_container(gen)
+        with self.assertRaises(HTTPException) as ctx:
+            await kv_cache_save()
+        self.assertEqual(ctx.exception.status_code, 500)
+
+        gen2 = FakeGenerator(save_result = {"skipped": "zero-stash", "n_pages": 0, "n_stashes": 0})
+        model_module.container = make_container(gen2)
+        with self.assertRaises(HTTPException) as ctx2:
+            await kv_cache_save()
+        self.assertEqual(ctx2.exception.status_code, 422)
+        self.assertIn("zero-stash", ctx2.exception.detail)
+
+        model_module.container = None
+        with self.assertRaises(HTTPException) as ctx3:
+            await kv_cache_save()
+        self.assertEqual(ctx3.exception.status_code, 422)
 
 
-# --------------------------------------------------------------------------- #
-# Save policy matrix                                                            #
-# --------------------------------------------------------------------------- #
+class KvRestoreTests(_KvCaseBase):
+    def test_restore_not_configured(self):
+        self.unconfigure()
+        gen = FakeGenerator()
+        container = make_container(gen)
+        container._kv_restore_on_create()
+        self.assertEqual(gen.restore_calls, [])
+        self.assertEqual(container.kv_status()["restore"]["reason"], "not-configured")
+
+    def test_restore_no_store_present_is_cold_start(self):
+        self.configure()
+        gen = FakeGenerator()
+        container = make_container(gen)
+        container._kv_restore_on_create()
+        self.assertEqual(gen.restore_calls, [])
+        rec = container.kv_status()["restore"]
+        self.assertFalse(rec["attempted"])
+        self.assertEqual(rec["reason"], "no-store")
+
+    def test_restore_ok_records_counts(self):
+        self.configure()
+        os.makedirs(self.store, exist_ok = True)
+        gen = FakeGenerator()
+        container = make_container(gen)
+        container._kv_restore_on_create()
+        self.assertEqual(gen.restore_calls, [self.store])
+        rec = container.kv_status()["restore"]
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["pages_restored"], 512)
+        self.assertEqual(rec["stashes_restored"], 4)
+        self.assertEqual(rec["deepest_anchor_page_idx"], 500)
+
+    def test_restore_failure_is_fail_closed_and_quarantines_set(self):
+        self.configure()
+        os.makedirs(self.store, exist_ok = True)
+        gen = FakeGenerator(restore_error = RuntimeError("digest mismatch"))
+        container = make_container(gen)
+        container._kv_restore_on_create()  # must not raise — the id keeps serving
+        rec = container.kv_status()["restore"]
+        self.assertFalse(rec["ok"])
+        self.assertTrue(rec["attempted"])
+        self.assertTrue(rec["reason"].startswith("rejected:"))
+        self.assertIn("digest mismatch", rec["reason"])
+        # The live path is vacated (no re-queue of the same failure) but the set is kept
+        self.assertFalse(os.path.isdir(self.store))
+        rejected = [p for p in os.listdir(self.tmp) if ".rejected-" in p]
+        self.assertEqual(len(rejected), 1)
 
 
-async def test_not_configured_refuses_and_keeps_set(kv_unconfigured):
-    gen = FakeGenerator()
-    container = make_container(gen)
-    code, record = await container.kv_save()
-    assert code == 422
-    assert record["status"] == "refused"
-    assert "not configured" in record["reason"]
-    assert gen.save_calls == []
+class KvStatusSurfaceTests(_KvCaseBase):
+    async def test_status_endpoint_reports_records(self):
+        self.configure()
+        gen = FakeGenerator()
+        container = make_container(gen)
+        container._kv_restore_on_create()  # production order: load (restore pass) precedes saves
+        await container.kv_save()
+        model_module.container = container
+        status = await kv_cache_status()
+        self.assertTrue(status.configured)
+        self.assertEqual(status.store_dir, self.store)
+        self.assertEqual(status.stash_budget_mb, 256)
+        self.assertTrue(status.generator_loaded)
+        self.assertEqual(status.last_save.status, "saved")
+        self.assertEqual(status.restore.reason, "no-store")
+
+    async def test_status_endpoint_without_container(self):
+        self.configure()
+        model_module.container = None
+        status = await kv_cache_status()
+        self.assertTrue(status.configured)
+        self.assertFalse(status.generator_loaded)
+        self.assertIsNone(status.last_save)
 
 
-async def test_no_generator_refuses_and_keeps_set(kv_config):
-    container = make_container(None)
-    code, record = await container.kv_save()
-    assert code == 422
-    assert record["status"] == "refused"
-    assert "no generator" in record["reason"]
+class KvSaveConfigTests(unittest.TestCase):
+    def test_kv_save_config_parses_from_section(self):
+        cfg = TabbyConfigModel.model_validate({
+            "kv_save": {"store_dir": "/tmp/kv-cache-tabby/test-id", "stash_budget_mb": 256},
+        })
+        self.assertEqual(cfg.kv_save.store_dir, "/tmp/kv-cache-tabby/test-id")
+        self.assertEqual(cfg.kv_save.stash_budget_mb, 256)
+
+    def test_kv_save_config_defaults_off(self):
+        cfg = TabbyConfigModel.model_validate({})
+        self.assertIsNone(cfg.kv_save.store_dir)
+        self.assertEqual(cfg.kv_save.stash_budget_mb, 512)
 
 
-async def test_latched_generator_refuses_and_keeps_set(kv_config):
-    gen = FakeGenerator()
-    gen.error = RuntimeError("latched")
-    container = make_container(gen)
-    code, record = await container.kv_save()
-    assert code == 422
-    assert record["status"] == "refused"
-    assert "latched" in record["reason"]
-    assert gen.save_calls == []
-
-
-async def test_busy_skips_immediately_without_waiting(kv_config):
-    gen = FakeGenerator(save_delay = 5.0)
-    container = make_container(gen)
-    container.active_job_ids["req-1"] = object()
-    code, record = await container.kv_save()
-    assert code == 409
-    assert record["status"] == "busy"
-    assert "1 active job" in record["reason"]
-    assert gen.save_calls == [], "D12: a busy save must not queue a snapshot"
-
-
-async def test_saved_200_carries_d8_observability(kv_config):
-    gen = FakeGenerator()
-    container = make_container(gen)
-    code, record = await container.kv_save()
-    assert code == 200
-    assert record["status"] == "saved"
-    assert record["n_pages"] == 512
-    assert record["n_stashes"] == 4
-    assert record["bytes"] == 3145728 + 2048 + 262144
-    assert record["save_ms"] is not None and record["save_ms"] >= 0
-    assert record["store_dir"] == kv_config.store_dir
-    assert gen.save_calls == [(kv_config.store_dir, 256)], "store + configured stash budget must be passed"
-    # The status surface mirrors the outcome for drill asserts
-    assert container.kv_status()["last_save"]["status"] == "saved"
-
-
-async def test_zero_stash_is_skipped_not_dead_set(kv_config):
-    """User decision 2026-09-24: zero-stash saves = skip + loud log, no dead sets."""
-    gen = FakeGenerator(save_result = {
-        "dir": None, "skipped": "zero-stash", "n_pages": 3, "n_stashes": 0,
-        "stash_keys": [], "checks": None, "meta": None, "deepest_anchor_page_idx": -1,
-    })
-    container = make_container(gen)
-    code, record = await container.kv_save()
-    assert code == 422
-    assert record["status"] == "skipped"
-    assert record["reason"] == "zero-stash"
-    assert record["n_pages"] == 3
-    assert record["n_stashes"] == 0
-    assert container.kv_status()["last_save"]["reason"] == "zero-stash"
-
-
-async def test_engine_exception_is_definitive_failure(kv_config):
-    gen = FakeGenerator(save_error = RuntimeError("io exploded"))
-    container = make_container(gen)
-    code, record = await container.kv_save()
-    assert code == 500
-    assert record["status"] == "error"
-    assert "io exploded" in record["reason"]
-
-
-async def test_save_timeout_is_definitive_failure(kv_config, monkeypatch):
-    gen = FakeGenerator(save_delay = 5.0)
-    container = make_container(gen)
-    monkeypatch.setattr(container, "KV_SAVE_TIMEOUT_S", 0.05)
-    code, record = await container.kv_save()
-    assert code == 504
-    assert record["status"] == "error"
-    assert "timed out" in record["reason"]
-
-
-async def test_save_endpoint_maps_status_codes(kv_config, monkeypatch):
-    gen = FakeGenerator(save_error = RuntimeError("boom"))
-    container = make_container(gen)
-    monkeypatch.setattr(model_module, "container", container)
-    with pytest.raises(HTTPException) as exc:
-        await kv_cache_save()
-    assert exc.value.status_code == 500
-
-    gen2 = FakeGenerator(save_result = {"skipped": "zero-stash", "n_pages": 0, "n_stashes": 0})
-    container2 = make_container(gen2)
-    monkeypatch.setattr(model_module, "container", container2)
-    with pytest.raises(HTTPException) as exc2:
-        await kv_cache_save()
-    assert exc2.value.status_code == 422
-    assert "zero-stash" in exc2.value.detail
-
-
-# --------------------------------------------------------------------------- #
-# Load-time restore (G4: exception-isolated, fail-closed to COLD)               #
-# --------------------------------------------------------------------------- #
-
-
-def test_restore_not_configured(kv_unconfigured):
-    gen = FakeGenerator()
-    container = make_container(gen)
-    container._kv_restore_on_create()
-    assert gen.restore_calls == []
-    assert container.kv_status()["restore"]["reason"] == "not-configured"
-
-
-def test_restore_no_store_present_is_cold_start(kv_config):
-    gen = FakeGenerator()
-    container = make_container(gen)
-    container._kv_restore_on_create()
-    assert gen.restore_calls == []
-    rec = container.kv_status()["restore"]
-    assert rec["attempted"] is False
-    assert rec["reason"] == "no-store"
-
-
-def test_restore_ok_records_counts(kv_config):
-    os.makedirs(kv_config.store_dir, exist_ok = True)
-    gen = FakeGenerator()
-    container = make_container(gen)
-    container._kv_restore_on_create()
-    assert gen.restore_calls == [kv_config.store_dir]
-    rec = container.kv_status()["restore"]
-    assert rec["ok"] is True
-    assert rec["pages_restored"] == 512
-    assert rec["stashes_restored"] == 4
-    assert rec["deepest_anchor_page_idx"] == 500
-
-
-def test_restore_failure_is_fail_closed_and_quarantines_set(kv_config):
-    os.makedirs(kv_config.store_dir, exist_ok = True)
-    gen = FakeGenerator(restore_error = RuntimeError("digest mismatch"))
-    container = make_container(gen)
-    container._kv_restore_on_create()  # must not raise — the id keeps serving
-    rec = container.kv_status()["restore"]
-    assert rec["ok"] is False
-    assert rec["attempted"] is True
-    assert rec["reason"].startswith("rejected:")
-    assert "digest mismatch" in rec["reason"]
-    # The live path is vacated (no re-queue of the same failure) but the set is kept for forensics
-    assert not os.path.isdir(kv_config.store_dir)
-    rejected = [p for p in os.listdir(os.path.dirname(kv_config.store_dir)) if ".rejected-" in p]
-    assert len(rejected) == 1
-
-
-# --------------------------------------------------------------------------- #
-# Status surface + config parsing                                               #
-# --------------------------------------------------------------------------- #
-
-
-async def test_status_endpoint_reports_records(kv_config, monkeypatch):
-    gen = FakeGenerator()
-    container = make_container(gen)
-    await container.kv_save()
-    monkeypatch.setattr(model_module, "container", container)
-    status = await kv_cache_status()
-    assert status.configured is True
-    assert status.store_dir == kv_config.store_dir
-    assert status.stash_budget_mb == 256
-    assert status.generator_loaded is True
-    assert status.last_save.status == "saved"
-    assert status.restore is not None
-
-
-async def test_status_endpoint_without_container(kv_config, monkeypatch):
-    monkeypatch.setattr(model_module, "container", None)
-    status = await kv_cache_status()
-    assert status.configured is True
-    assert status.generator_loaded is False
-    assert status.last_save is None
-
-
-def test_kv_save_config_parses_from_section():
-    cfg = TabbyConfigModel.model_validate({
-        "kv_save": {"store_dir": "/tmp/kv-cache-tabby/test-id", "stash_budget_mb": 256},
-    })
-    assert cfg.kv_save.store_dir == "/tmp/kv-cache-tabby/test-id"
-    assert cfg.kv_save.stash_budget_mb == 256
-
-
-def test_kv_save_config_defaults_off():
-    cfg = TabbyConfigModel.model_validate({})
-    assert cfg.kv_save.store_dir is None
-    assert cfg.kv_save.stash_budget_mb == 512
+if __name__ == "__main__":
+    unittest.main()
