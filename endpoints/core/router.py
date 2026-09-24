@@ -21,6 +21,7 @@ from common.utils import unwrap
 from common.health import HealthManager
 from endpoints.OAI.utils.chat_completion import format_messages_with_template
 from endpoints.core.types.auth import AuthPermissionResponse
+from endpoints.core.types.cache import KvCacheStatusResponse, KvSaveRecord
 from endpoints.core.types.download import DownloadRequest, DownloadResponse
 from endpoints.core.types.lora import LoraList, LoraLoadRequest, LoraLoadResponse
 from endpoints.core.types.model import (
@@ -214,6 +215,51 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
 async def unload_model():
     """Unloads the currently loaded model."""
     await model.unload_model(skip_wait=True)
+
+
+# KV cache save/restore (save-session) — kv-persistence/tabby-save-session-plan.md P2.
+# Both paths are gateway-blocked in production (models-serve block-list, P3); the auth
+# dependency covers direct/dev access. There is deliberately NO restore endpoint: restore is
+# automatic and fail-closed at model load (llama precedent — driver saves, server restores).
+@router.post("/v1/cache/save", dependencies=[Depends(check_api_key)])
+async def kv_cache_save() -> KvSaveRecord:
+    """Write this id's KV save store (pre-stop save trigger).
+
+    D12: busy (active jobs) is skipped immediately — no waiting, loud log, existing set kept.
+    Zero-stash captures are skipped the same way (no dead sets). Status codes carry the save-side
+    D3 class: 409 busy-skip, 422 refused/skipped (nothing written, set kept), 5xx machinery
+    failure (definitive failure class).
+    """
+
+    if model.container is None:
+        raise HTTPException(422, "kv save refused: no model container — existing set kept")
+
+    code, record = await model.container.kv_save()
+    if code != 200:
+        detail = f"kv save {record['status']}"
+        if record.get("reason"):
+            detail += f": {record['reason']}"
+        raise HTTPException(code, detail)
+
+    return KvSaveRecord(**record)
+
+
+@router.get("/v1/cache/status", dependencies=[Depends(check_api_key)])
+async def kv_cache_status() -> KvCacheStatusResponse:
+    """KV save/restore state: load-time restore outcome + last save attempt.
+
+    Exists so drivers and drills assert on state instead of log-grep."""
+
+    kv = getattr(config, "kv_save", None)
+    if model.container is None:
+        return KvCacheStatusResponse(
+            configured=bool(kv is not None and kv.store_dir),
+            store_dir=str(kv.store_dir) if kv is not None and kv.store_dir else None,
+            stash_budget_mb=kv.stash_budget_mb if kv is not None else None,
+            generator_loaded=False,
+        )
+
+    return KvCacheStatusResponse(**model.container.kv_status())
 
 
 @router.post("/v1/download", dependencies=[Depends(check_admin_key)])
