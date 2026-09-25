@@ -727,6 +727,33 @@ class DeveloperConfig(BaseConfigModel):
     )
 
 
+class KvSaveConfig(BaseConfigModel):
+    """KV cache save/restore (save-session) for this id.
+
+    The store is per-id on purpose: 204k and 130k shapes share `model_name` (identical page
+    hashes) so a name-derived path would collide; the path is declared here instead.
+    """
+
+    store_dir: Optional[str] = Field(
+        None,
+        description=(
+            "Final directory for this id's KV save store (e.g. /tmp/kv-cache-tabby/<id>).\n"
+            "When set, the server restores from it eagerly at model load (fail-closed to a\n"
+            "cold start; a rejected set is renamed *.rejected-<ts> and kept for forensics)\n"
+            "and writes it on POST /v1/cache/save. When absent, save/restore is disabled."
+        ),
+    )
+    stash_budget_mb: Optional[int] = Field(
+        512,
+        description=(
+            "Budget for recurrent (GDN) checkpoints kept in a save, deepest-first, in MB.\n"
+            "A capture with zero stashes is skipped entirely (a pages-only store can never\n"
+            "restore on a hybrid model — no dead sets). 0 = keep only the newest stash."
+        ),
+        ge=0,
+    )
+
+
 class TabbyConfigModel(BaseModel):
     """Base model for a TabbyConfig."""
 
@@ -756,6 +783,9 @@ class TabbyConfigModel(BaseModel):
     )
     memory: Optional[MemoryConfig] = Field(
         default_factory=MemoryConfig.model_construct,
+    )
+    kv_save: Optional[KvSaveConfig] = Field(
+        default_factory=KvSaveConfig.model_construct,
     )
     developer: Optional[DeveloperConfig] = Field(
         default_factory=DeveloperConfig.model_construct,

@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import os
 import pathlib
 import re
 import time
@@ -147,6 +148,8 @@ class ExllamaV3Container:
         self.load_lock = asyncio.Lock()
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
+        self._kv_last_save = None
+        self._kv_restore = None
 
     # Required methods
     @classmethod
@@ -827,6 +830,10 @@ class ExllamaV3Container:
             # Update the state of the container var
             if self.max_batch_size is None:
                 self.max_batch_size = self.generator.generator.max_batch_size
+
+            # Eager KV save-store restore (save-session P2): exception-isolated — a rejected
+            # store must leave the id serving COLD, never wedged (G4).
+            self._kv_restore_on_create()
         finally:
             # This means the generator is being recreated
             # The load lock is already released in the load function
@@ -835,6 +842,221 @@ class ExllamaV3Container:
 
                 async with self.load_condition:
                     self.load_condition.notify_all()
+
+    # ---------------------------------------------------------------------------
+    # KV cache save/restore (save-session) — kv-persistence/tabby-save-session-plan.md P2.
+    # Store layout/semantics come from the engine's Generator.save_state/restore_state (P1);
+    # this layer owns the endpoint policy: D12 no-wait busy skip, zero-stash skip, fail-closed
+    # restore, and the status surface the P3 drills assert against.
+    # ---------------------------------------------------------------------------
+
+    KV_SAVE_TIMEOUT_S = 120.0
+
+    def _kv_store_dir(self):
+        kv = getattr(config, "kv_save", None)
+        if kv is None or not kv.store_dir:
+            return None
+        return str(kv.store_dir)
+
+    def _kv_stash_budget_mb(self):
+        kv = getattr(config, "kv_save", None)
+        return None if kv is None else kv.stash_budget_mb
+
+    def _kv_restore_on_create(self):
+        """Eagerly restore this id's KV save-store into the fresh generator (P2).
+
+        Exception-isolated fail-closed-to-COLD (G4): any restore failure logs loudly and the id
+        keeps serving from an empty pool. A rejected set is renamed `*.rejected-<ts>` (kept for
+        forensics) so the next load does not re-queue the same failure forever.
+        """
+        self._kv_restore = {
+            "attempted": False, "ok": False, "reason": None, "store_dir": None,
+            "pages_restored": 0, "stashes_restored": 0, "deepest_anchor_page_idx": -1,
+            "at": time.time(),
+        }
+        store = self._kv_store_dir()
+        if store is None:
+            self._kv_restore["reason"] = "not-configured"
+            return
+        self._kv_restore["store_dir"] = store
+        try:
+            has_store = os.path.isdir(store)
+            is_empty = has_store and not os.listdir(store)
+        except OSError as exc:
+            # G4 letter: an unreadable path must fail closed to COLD and never wedge the load.
+            # (os.path.isdir swallows OSError itself, so this branch is really os.listdir — a
+            # parent-unsearchable dir reads as no-store below; still COLD, still safe.)
+            self._kv_restore["reason"] = f"rejected: store path unreadable ({exc})"
+            xlogger.warning(f"kv restore REJECTED (unreadable store path: {exc}) — serving COLD")
+            self._kv_quarantine_store(store)
+            return
+        if not has_store:
+            self._kv_restore["reason"] = "no-store"
+            xlogger.info(f"kv restore: no store at {store} — serving cold")
+            return
+        if is_empty:
+            # An existing-but-empty dir (e.g. pre-created by the driver) is not a candidate set:
+            # it must read as no-store, not be quarantined as a rejected set on every cold start
+            # (P2 review R5). A leftover empty dir is harmless for the next save's atomic rename.
+            self._kv_restore["reason"] = "no-store"
+            xlogger.info(f"kv restore: empty store dir at {store} — serving cold")
+            return
+        self._kv_restore["attempted"] = True
+        try:
+            result = self.generator.restore_state(store)
+        except Exception as exc:
+            self._kv_restore["reason"] = f"rejected: {exc}"
+            xlogger.warning(
+                f"kv restore REJECTED ({exc}) — serving COLD; set kept/renamed for forensics"
+            )
+            self._kv_quarantine_store(store)
+            return
+        self._kv_restore.update({
+            "ok": True,
+            "pages_restored": int(result.get("pages_restored", 0)),
+            "stashes_restored": int(result.get("stashes_restored", 0)),
+            "deepest_anchor_page_idx": int(result.get("deepest_anchor_page_idx", -1)),
+        })
+        xlogger.info(
+            f"kv restore ok: store={store} pages={self._kv_restore['pages_restored']} "
+            f"stashes={self._kv_restore['stashes_restored']} "
+            f"deepest_anchor_page={self._kv_restore['deepest_anchor_page_idx']}"
+        )
+
+    def _kv_quarantine_store(self, store):
+        """Rename a rejected set out of the live path; never delete (forensics)."""
+        try:
+            renamed = f"{store}.rejected-{int(time.time())}"
+            os.rename(store, renamed)
+            xlogger.warning(f"kv store renamed for forensics: {store} -> {renamed}")
+        except Exception as exc:
+            xlogger.warning(f"kv store rename failed ({exc}) — keeping {store} in place")
+
+    async def kv_save(self):
+        """Run one pre-stop KV save and record the outcome for /v1/cache/status.
+
+        Returns (status_code, record):
+          200 "saved"   — set written atomically
+          409 "busy"    — active jobs; D12 no-wait skip, nothing written, existing set kept
+          422 "skipped" — zero-stash capture; no dead set written (user decision 2026-09-24)
+          422 "refused" — not configured / no generator / latched generator error
+          500/504 "error" — the save machinery itself failed (definitive failure class)
+        """
+        record = {
+            "status": "pending", "reason": None,
+            "store_dir": self._kv_store_dir(),
+            "stash_budget_mb": self._kv_stash_budget_mb(),
+            "save_ms": None, "n_pages": 0, "n_stashes": 0, "bytes": 0, "at": time.time(),
+        }
+        self._kv_last_save = record
+
+        if record["store_dir"] is None:
+            record.update(status = "refused", reason = "kv_save.store_dir not configured")
+            xlogger.warning(f"kv save refused: {record['reason']} — nothing written, existing set kept")
+            return 422, record
+
+        try:
+            await self.load_lock.acquire()
+        except asyncio.CancelledError:
+            # Cancelled while queued for the lock: the try/finally below never ran, no future
+            # exists to settle the record — mark it here so the status surface never sticks at
+            # the placeholder (P2 confirmation-round QF3).
+            if record["status"] == "pending":
+                record.update(status = "aborted", reason = "request cancelled before the save settled")
+            raise
+        try:
+            # Re-check under the lock: a concurrent unload/swap nulls the generator while holding
+            # it, so the unlocked view alone could hand request_save a None and turn the polite 422
+            # into a spurious definitive 500 — destructive under the P3 driver policy (P2 review R2).
+            if self.generator is None:
+                record.update(status = "refused", reason = "no generator loaded")
+                xlogger.warning(f"kv save refused: {record['reason']} — existing set kept")
+                return 422, record
+            if self.generator.error is not None:
+                record.update(status = "refused", reason = f"generator latched failed: {self.generator.error!r}")
+                xlogger.warning(f"kv save refused: {record['reason']} — existing set kept")
+                return 422, record
+            if self.active_job_ids:
+                record.update(status = "busy", reason = f"{len(self.active_job_ids)} active job(s)")
+                xlogger.warning(
+                    f"kv save SKIPPED (busy): {record['reason']} — nothing written, existing set kept"
+                )
+                return 409, record
+
+            # Empty active_job_ids is the quiescence certificate (drain-time on_queue_drained has
+            # already run — see save-state-q1-design.md C2). The snapshot itself executes inside the
+            # iteration task, strictly serialized with iterate() (Q1): request_save queues a save
+            # pass on that loop and returns the result future.
+            t0 = time.perf_counter()
+            try:
+                fut = self.generator.request_save(
+                    record["store_dir"], stash_budget_mb = record["stash_budget_mb"]
+                )
+                # An abandoned/cancelled request leaves nothing to settle the record; mark it so
+                # /v1/cache/status never shows a stale placeholder (P2 review F10).
+                fut.add_done_callback(lambda f: self._kv_mark_aborted(f, record))
+                result = await asyncio.wait_for(fut, timeout = self.KV_SAVE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                record.update(status = "error", reason = f"save timed out after {self.KV_SAVE_TIMEOUT_S}s")
+                xlogger.error(f"kv save FAILED: {record['reason']}")
+                return 504, record
+            except Exception as exc:
+                record.update(status = "error", reason = f"{type(exc).__name__}: {exc}")
+                xlogger.error(f"kv save FAILED: {record['reason']}")
+                return 500, record
+            save_ms = (time.perf_counter() - t0) * 1000.0
+
+            if result.get("skipped"):
+                record.update(
+                    status = "skipped", reason = str(result["skipped"]), save_ms = save_ms,
+                    n_pages = int(result.get("n_pages", 0)), n_stashes = 0,
+                )
+                xlogger.warning(
+                    f"kv save SKIPPED ({result['skipped']}): {record['n_pages']} page(s), zero "
+                    f"stashes — no dead set written; existing set kept"
+                )
+                return 422, record
+
+            meta = result.get("meta") or {}
+            nbytes = sum(int(f.get("size", 0)) for f in (meta.get("files") or {}).values())
+            record.update(
+                status = "saved", save_ms = save_ms,
+                n_pages = int(result.get("n_pages", 0)),
+                n_stashes = int(result.get("n_stashes", 0)),
+                bytes = nbytes,
+            )
+            xlogger.info(
+                f"kv save ok: store={record['store_dir']} pages={record['n_pages']} "
+                f"stashes={record['n_stashes']} bytes={record['bytes']} save_ms={save_ms:.1f}"
+            )
+            return 200, record
+        finally:
+            self.load_lock.release()
+            # Pair the release with a condition notify, exactly like every other load_lock holder
+            # (load_gen / create_generator / unload): generation requests parked on
+            # load_condition.wait_for wake ONLY on notify, and a bare release strands them until
+            # the next unrelated load/unload (P2 review R1/F1/E1 — caught by 4/4 blind eyes).
+            async with self.load_condition:
+                self.load_condition.notify_all()
+
+    @staticmethod
+    def _kv_mark_aborted(fut, record):
+        if fut.cancelled() and record["status"] == "pending":
+            record.update(status = "aborted", reason = "request cancelled before the save settled")
+
+    def kv_status(self):
+        """Status surface for save/restore: what was restored at load and the last save outcome.
+
+        Exists so the P3 drills and driver health checks assert on state instead of log-grep.
+        """
+        return {
+            "configured": self._kv_store_dir() is not None,
+            "store_dir": self._kv_store_dir(),
+            "stash_budget_mb": self._kv_stash_budget_mb(),
+            "generator_loaded": self.generator is not None,
+            "restore": self._kv_restore,
+            "last_save": self._kv_last_save,
+        }
 
     async def unload(self, loras_only: bool = False, **kwargs):
         """
