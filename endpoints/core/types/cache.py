@@ -15,7 +15,8 @@ class KvSaveRecord(BaseModel):
     save_ms: Optional[float] = Field(None, description="Wall time of the snapshot, in milliseconds")
     n_pages: int = Field(0, description="KV pages captured")
     n_stashes: int = Field(0, description="Recurrent (GDN) checkpoints captured")
-    bytes: int = Field(0, description="Total bytes published (sum of the set's file sizes)")
+    bytes: int = Field(0, description="Total bytes published (sum of the payload file sizes "
+                                      "recorded in meta['files']; excludes meta.json itself)")
     at: Optional[float] = Field(None, description="unix timestamp of the attempt")
 
 

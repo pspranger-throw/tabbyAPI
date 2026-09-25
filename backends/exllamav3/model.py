@@ -879,9 +879,25 @@ class ExllamaV3Container:
             self._kv_restore["reason"] = "not-configured"
             return
         self._kv_restore["store_dir"] = store
-        if not os.path.isdir(store):
+        try:
+            has_store = os.path.isdir(store)
+            is_empty = has_store and not os.listdir(store)
+        except OSError as exc:
+            # G4 letter: an unreadable path must fail closed to COLD and never wedge the load
+            self._kv_restore["reason"] = f"rejected: store path unreadable ({exc})"
+            xlogger.warning(f"kv restore REJECTED (unreadable store path: {exc}) — serving COLD")
+            self._kv_quarantine_store(store)
+            return
+        if not has_store:
             self._kv_restore["reason"] = "no-store"
             xlogger.info(f"kv restore: no store at {store} — serving cold")
+            return
+        if is_empty:
+            # An existing-but-empty dir (e.g. pre-created by the driver) is not a candidate set:
+            # it must read as no-store, not be quarantined as a rejected set on every cold start
+            # (P2 review R5). A leftover empty dir is harmless for the next save's atomic rename.
+            self._kv_restore["reason"] = "no-store"
+            xlogger.info(f"kv restore: empty store dir at {store} — serving cold")
             return
         self._kv_restore["attempted"] = True
         try:
@@ -925,7 +941,7 @@ class ExllamaV3Container:
           500/504 "error" — the save machinery itself failed (definitive failure class)
         """
         record = {
-            "status": None, "reason": None,
+            "status": "pending", "reason": None,
             "store_dir": self._kv_store_dir(),
             "stash_budget_mb": self._kv_stash_budget_mb(),
             "save_ms": None, "n_pages": 0, "n_stashes": 0, "bytes": 0, "at": time.time(),
@@ -936,17 +952,20 @@ class ExllamaV3Container:
             record.update(status = "refused", reason = "kv_save.store_dir not configured")
             xlogger.warning(f"kv save refused: {record['reason']} — nothing written, existing set kept")
             return 422, record
-        if self.generator is None:
-            record.update(status = "refused", reason = "no generator loaded")
-            xlogger.warning(f"kv save refused: {record['reason']} — existing set kept")
-            return 422, record
-        if self.generator.error is not None:
-            record.update(status = "refused", reason = f"generator latched failed: {self.generator.error!r}")
-            xlogger.warning(f"kv save refused: {record['reason']} — existing set kept")
-            return 422, record
 
         await self.load_lock.acquire()
         try:
+            # Re-check under the lock: a concurrent unload/swap nulls the generator while holding
+            # it, so the unlocked view alone could hand request_save a None and turn the polite 422
+            # into a spurious definitive 500 — destructive under the P3 driver policy (P2 review R2).
+            if self.generator is None:
+                record.update(status = "refused", reason = "no generator loaded")
+                xlogger.warning(f"kv save refused: {record['reason']} — existing set kept")
+                return 422, record
+            if self.generator.error is not None:
+                record.update(status = "refused", reason = f"generator latched failed: {self.generator.error!r}")
+                xlogger.warning(f"kv save refused: {record['reason']} — existing set kept")
+                return 422, record
             if self.active_job_ids:
                 record.update(status = "busy", reason = f"{len(self.active_job_ids)} active job(s)")
                 xlogger.warning(
@@ -963,6 +982,9 @@ class ExllamaV3Container:
                 fut = self.generator.request_save(
                     record["store_dir"], stash_budget_mb = record["stash_budget_mb"]
                 )
+                # An abandoned/cancelled request leaves nothing to settle the record; mark it so
+                # /v1/cache/status never shows a stale placeholder (P2 review F10).
+                fut.add_done_callback(lambda f: self._kv_mark_aborted(f, record))
                 result = await asyncio.wait_for(fut, timeout = self.KV_SAVE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 record.update(status = "error", reason = f"save timed out after {self.KV_SAVE_TIMEOUT_S}s")
@@ -1000,6 +1022,17 @@ class ExllamaV3Container:
             return 200, record
         finally:
             self.load_lock.release()
+            # Pair the release with a condition notify, exactly like every other load_lock holder
+            # (load_gen / create_generator / unload): generation requests parked on
+            # load_condition.wait_for wake ONLY on notify, and a bare release strands them until
+            # the next unrelated load/unload (P2 review R1/F1/E1 — caught by 4/4 blind eyes).
+            async with self.load_condition:
+                self.load_condition.notify_all()
+
+    @staticmethod
+    def _kv_mark_aborted(fut, record):
+        if fut.cancelled() and record["status"] == "pending":
+            record.update(status = "aborted", reason = "request cancelled before the save settled")
 
     def kv_status(self):
         """Status surface for save/restore: what was restored at load and the last save outcome.

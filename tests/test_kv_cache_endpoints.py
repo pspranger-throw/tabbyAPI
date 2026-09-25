@@ -74,13 +74,23 @@ class FakeGenerator:
             "meta": {},
         }
 
-    async def request_save(self, store, stash_budget_mb = None):
+    def request_save(self, store, stash_budget_mb = None):
+        """Sync call returning a Future — mirrors AsyncGenerator.request_save's real surface.
+        An `async def` fake has different cancel semantics than production (P2 review R7/F7)."""
         self.save_calls.append((store, stash_budget_mb))
-        if self.save_delay:
-            await asyncio.sleep(self.save_delay)
-        if self.save_error is not None:
-            raise self.save_error
-        return self.save_result
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+
+        def _complete():
+            if fut.done():
+                return
+            if self.save_error is not None:
+                fut.set_exception(self.save_error)
+            else:
+                fut.set_result(self.save_result)
+
+        loop.call_later(self.save_delay, _complete)
+        return fut
 
     def restore_state(self, store):
         self.restore_calls.append(store)
@@ -121,6 +131,12 @@ class _KvCaseBase(unittest.IsolatedAsyncioTestCase):
 
     def unconfigure(self):
         config.kv_save = KvSaveConfig()
+
+    def _make_store(self):
+        """A store dir that reads as a candidate set (non-empty, with a meta.json)."""
+        os.makedirs(self.store, exist_ok = True)
+        with open(os.path.join(self.store, "meta.json"), "w") as f:
+            f.write("{}")
 
 
 class KvSavePolicyTests(_KvCaseBase):
@@ -216,6 +232,52 @@ class KvSavePolicyTests(_KvCaseBase):
         self.assertEqual(record["status"], "error")
         self.assertIn("timed out", record["reason"])
 
+    async def test_save_releases_and_wakes_condition_waiters(self):
+        """The save path must pair the load_lock release with a load_condition notify like every
+        other lock holder: a generation request parked during a save must wake when the save ends
+        (P2 review R1/F1/E1 — 4/4 blind eyes). Pre-fix this hangs until an unrelated notify."""
+        self.configure()
+        gen = FakeGenerator(save_delay = 0.2)
+        container = make_container(gen)
+        save_task = asyncio.create_task(container.kv_save())
+        await asyncio.sleep(0.05)
+        self.assertTrue(container.load_lock.locked(), "kv_save must hold the lock while saving")
+
+        woken = asyncio.Event()
+
+        async def waiter():
+            async with container.load_condition:
+                await container.load_condition.wait_for(lambda: not container.load_lock.locked())
+            woken.set()
+
+        waiter_task = asyncio.create_task(waiter())
+        await asyncio.sleep(0.05)  # let the waiter park on the held lock
+        code, record = await save_task
+        self.assertEqual(code, 200)
+        await asyncio.wait_for(woken.wait(), timeout = 2.0)
+        await waiter_task
+
+    async def test_generator_vanished_under_lock_refuses_not_errors(self):
+        """A generator that disappears between the unlocked view and the lock (unload/swap holds
+        the lock while nulling it) must yield the polite 422, not a spurious definitive 500
+        (P2 review R2 — destructive under the P3 driver policy)."""
+        self.configure()
+        gen = FakeGenerator()
+        container = make_container(gen)
+        orig_acquire = container.load_lock.acquire
+
+        async def acquire_then_null():
+            res = await orig_acquire()
+            container.generator = None
+            return res
+
+        container.load_lock.acquire = acquire_then_null
+        code, record = await container.kv_save()
+        self.assertEqual(code, 422)
+        self.assertEqual(record["status"], "refused")
+        self.assertIn("no generator", record["reason"])
+        self.assertEqual(gen.save_calls, [])
+
     async def test_save_endpoint_maps_status_codes(self):
         self.configure()
         gen = FakeGenerator(save_error = RuntimeError("boom"))
@@ -258,7 +320,7 @@ class KvRestoreTests(_KvCaseBase):
 
     def test_restore_ok_records_counts(self):
         self.configure()
-        os.makedirs(self.store, exist_ok = True)
+        self._make_store()
         gen = FakeGenerator()
         container = make_container(gen)
         container._kv_restore_on_create()
@@ -269,9 +331,24 @@ class KvRestoreTests(_KvCaseBase):
         self.assertEqual(rec["stashes_restored"], 4)
         self.assertEqual(rec["deepest_anchor_page_idx"], 500)
 
+    def test_restore_empty_dir_is_no_store_not_rejected(self):
+        """An existing-but-empty store dir (e.g. pre-created by the driver) is not a candidate
+        set: no-store, no quarantine (P2 review R5)."""
+        self.configure()
+        os.makedirs(self.store)  # empty on purpose
+        gen = FakeGenerator()
+        container = make_container(gen)
+        container._kv_restore_on_create()
+        self.assertEqual(gen.restore_calls, [])
+        rec = container.kv_status()["restore"]
+        self.assertFalse(rec["attempted"])
+        self.assertEqual(rec["reason"], "no-store")
+        self.assertTrue(os.path.isdir(self.store), "an empty dir must not be quarantined")
+        self.assertEqual([p for p in os.listdir(self.tmp) if ".rejected-" in p], [])
+
     def test_restore_failure_is_fail_closed_and_quarantines_set(self):
         self.configure()
-        os.makedirs(self.store, exist_ok = True)
+        self._make_store()
         gen = FakeGenerator(restore_error = RuntimeError("digest mismatch"))
         container = make_container(gen)
         container._kv_restore_on_create()  # must not raise — the id keeps serving
