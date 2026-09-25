@@ -5,3 +5,7 @@ export CUDAHOSTCXX=/usr/bin/gcc-14
 export MAX_JOBS=16
 export TORCH_CUDA_ARCH_LIST="7.5;8.6"
 export TORCH_EXTENSIONS_DIR=/home/pageai/.cache/exl3_sm75c_ext
+# engine fork revision pin: venv-sm75-v150 is a site-packages copy (save-path
+# rev-proof, kvstore.engine_fork_revision) — a venv copy must carry this pin.
+# 548dde0 = sm75-v150 merge of the kvsave workstream (P4 flip 2026-09-25).
+export EXL3_KVSAVE_REV=548dde0dd88cddf6e644d2073fc70e9488784527
