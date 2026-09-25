@@ -220,3 +220,7 @@ openapi.json
 # Local build venv (restructure B1 target location)
 venv-sm75-v150/
 venv-kvsave/
+venv-sm75-v151/
+
+# per-venv engine rev stamps (registry is the SSOT; stamps are install-time state)
+.kvsave-rev-*.local

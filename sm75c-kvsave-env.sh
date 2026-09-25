@@ -16,3 +16,11 @@ export EXL3_MOE_PINNED_ARENA=1
 # 500ce04 P2 save surface (delegates + save pass + zero-stash skip) 2026-09-24 ->
 # c913ac7 P2 review-fix round 2026-09-25)
 export EXL3_KVSAVE_REV=c913ac7a82537395895cd57b22312df9f1da6caa
+# per-venv rev stamp (venv-kvsave), written by the venv-install procedure:
+#   printf 'EXL3_KVSAVE_REV=%s\n' "$REV" > "$(dirname "${BASH_SOURCE[0]}")/.kvsave-rev-venv-kvsave.local"
+# SSOT = models-serve registry .env.EXL3_KVSAVE_REV (operationally binding).
+# Sourced AFTER the literal export above so a present stamp wins; absent stamp
+# = the committed literal pin (keep both in sync until the next venv install).
+_stamp="$(dirname "${BASH_SOURCE[0]}")/.kvsave-rev-venv-kvsave.local"
+if [ -f "$_stamp" ]; then . "$_stamp"; export EXL3_KVSAVE_REV; fi
+unset _stamp
