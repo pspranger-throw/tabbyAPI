@@ -278,6 +278,65 @@ class KvSavePolicyTests(_KvCaseBase):
         self.assertIn("no generator", record["reason"])
         self.assertEqual(gen.save_calls, [])
 
+    async def test_cancelled_save_task_settles_record_as_aborted(self):
+        """A client disconnect (task cancel) mid-save must leave a settled record, not a stale
+        placeholder: status `aborted` via the future's done-callback (P2 confirmation QF2)."""
+        self.configure()
+        gen = FakeGenerator(save_delay = 5.0)
+        container = make_container(gen)
+        save_task = asyncio.create_task(container.kv_save())
+        await asyncio.sleep(0.05)
+        self.assertTrue(container.load_lock.locked())
+        save_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await save_task
+        await asyncio.sleep(0)  # let the future's done-callback run
+        self.assertEqual(container._kv_last_save["status"], "aborted")
+
+    async def test_cancel_while_queued_for_lock_settles_record_as_aborted(self):
+        """Cancellation while parked on load_lock.acquire (before request_save exists) must also
+        settle the record — the try/finally never runs there (P2 confirmation QF3)."""
+        self.configure()
+        gen = FakeGenerator()
+        container = make_container(gen)
+        await container.load_lock.acquire()  # hold the lock so kv_save queues
+        try:
+            save_task = asyncio.create_task(container.kv_save())
+            await asyncio.sleep(0.05)
+            save_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await save_task
+        finally:
+            container.load_lock.release()
+            async with container.load_condition:
+                container.load_condition.notify_all()
+        self.assertEqual(container._kv_last_save["status"], "aborted")
+        self.assertEqual(gen.save_calls, [])
+
+    async def test_unreadable_store_path_is_fail_closed_not_wedged(self):
+        """os.listdir OSError on the store dir must fail closed to COLD (G4 letter) and never
+        raise out of the load path (P2 confirmation N1/QF6 coverage)."""
+        self.configure()
+        os.makedirs(self.store, exist_ok = True)
+        os.chmod(self.store, 0o000)
+        try:
+            gen = FakeGenerator()
+            container = make_container(gen)
+            container._kv_restore_on_create()  # must not raise
+        finally:
+            # the quarantine renames the dir away — unlock whatever is left in tmp
+            for name in os.listdir(self.tmp):
+                p = os.path.join(self.tmp, name)
+                if os.path.isdir(p):
+                    try:
+                        os.chmod(p, 0o755)
+                    except OSError:
+                        pass
+        rec = container.kv_status()["restore"]
+        self.assertFalse(rec["ok"])
+        self.assertTrue(rec["reason"].startswith("rejected: store path unreadable"))
+        self.assertEqual(gen.restore_calls, [])
+
     async def test_save_endpoint_maps_status_codes(self):
         self.configure()
         gen = FakeGenerator(save_error = RuntimeError("boom"))

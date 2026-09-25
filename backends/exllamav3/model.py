@@ -883,7 +883,9 @@ class ExllamaV3Container:
             has_store = os.path.isdir(store)
             is_empty = has_store and not os.listdir(store)
         except OSError as exc:
-            # G4 letter: an unreadable path must fail closed to COLD and never wedge the load
+            # G4 letter: an unreadable path must fail closed to COLD and never wedge the load.
+            # (os.path.isdir swallows OSError itself, so this branch is really os.listdir — a
+            # parent-unsearchable dir reads as no-store below; still COLD, still safe.)
             self._kv_restore["reason"] = f"rejected: store path unreadable ({exc})"
             xlogger.warning(f"kv restore REJECTED (unreadable store path: {exc}) — serving COLD")
             self._kv_quarantine_store(store)
@@ -953,7 +955,15 @@ class ExllamaV3Container:
             xlogger.warning(f"kv save refused: {record['reason']} — nothing written, existing set kept")
             return 422, record
 
-        await self.load_lock.acquire()
+        try:
+            await self.load_lock.acquire()
+        except asyncio.CancelledError:
+            # Cancelled while queued for the lock: the try/finally below never ran, no future
+            # exists to settle the record — mark it here so the status surface never sticks at
+            # the placeholder (P2 confirmation-round QF3).
+            if record["status"] == "pending":
+                record.update(status = "aborted", reason = "request cancelled before the save settled")
+            raise
         try:
             # Re-check under the lock: a concurrent unload/swap nulls the generator while holding
             # it, so the unlocked view alone could hand request_save a None and turn the polite 422

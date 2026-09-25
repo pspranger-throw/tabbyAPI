@@ -748,7 +748,7 @@ class KvSaveConfig(BaseConfigModel):
         description=(
             "Budget for recurrent (GDN) checkpoints kept in a save, deepest-first, in MB.\n"
             "A capture with zero stashes is skipped entirely (a pages-only store can never\n"
-            "restore on a hybrid model — no dead sets)."
+            "restore on a hybrid model — no dead sets). 0 = keep only the newest stash."
         ),
         ge=0,
     )

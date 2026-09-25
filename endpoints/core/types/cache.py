@@ -7,7 +7,7 @@ class KvSaveRecord(BaseModel):
 
     status: Optional[str] = Field(
         None,
-        description="saved | skipped | busy | refused | error",
+        description="pending (in-flight) | saved | skipped | busy | refused | aborted | error",
     )
     reason: Optional[str] = Field(None, description="Machine-readable skip/refuse/failure reason")
     store_dir: Optional[str] = Field(None, description="Final store directory written or targeted")
