@@ -276,8 +276,12 @@ class ModelConfig(BaseConfigModel):
     autosplit_reserve: List[float] = Field(
         [96],
         description=(
-            "Reserve VRAM used for autosplit loading (default: 96 MB on GPU 0).\n"
-            "Represented as an array of MB per GPU."
+            "Reserve VRAM used when loading a model (default: 96 MB on GPU 0).\n"
+            "Represented as an array of MB per GPU.\n"
+            "A negative value excludes that GPU from the model split, so\n"
+            "excluding every GPU will fail to load.\n"
+            "Ignored for a model whose placement is already set by gpu_split\n"
+            "or draft_gpu_split."
         ),
     )
     gpu_split: List[float] = Field(
@@ -375,6 +379,36 @@ class ModelConfig(BaseConfigModel):
         ),
         ge=1,
     )
+    recurrent_checkpoint_interval: Optional[int] = Field(
+        None,
+        description=(
+            "Tokens between recurrent state checkpoints near the end of the prompt and\n"
+            "during generation (default: None, the engine's per-architecture default,\n"
+            "2048 for most models). Only used by models with recurrent (linear or sliding\n"
+            "attention) layers. Must be a multiple of 256."
+        ),
+        multiple_of=256,
+        gt=0,
+    )
+    recurrent_checkpoint_interval_pp: Optional[int] = Field(
+        None,
+        description=(
+            "Tokens between recurrent state checkpoints during prompt ingestion, further\n"
+            "than 2 * chunk_size from the end of the prompt (default: None, the engine\n"
+            "default of 32768). Only used by models with recurrent layers. Must be a\n"
+            "multiple of 256 and is rounded up to a multiple of chunk_size.\n"
+            "Recurrent states cannot be rolled back, so a request that edits an earlier\n"
+            "part of a cached prompt replays from the last checkpoint before the edit.\n"
+            "With the default, a long prompt is only checkpointed near its end and an\n"
+            "early edit costs a full re-prefill; with a denser grid the replay cost becomes\n"
+            "proportional to the distance from the edit to the end of the prompt.\n"
+            "Each checkpoint costs one recurrent state of system RAM (148 MiB for a 27B\n"
+            "hybrid with 48 recurrent layers), bounded by memory.sysmem_recurrent_cache,\n"
+            "and cold prefill is 2-3% slower at 2048 or 1024."
+        ),
+        multiple_of=256,
+        gt=0,
+    )
     prompt_template: Optional[str] = Field(
         None,
         description=(
@@ -388,6 +422,16 @@ class ModelConfig(BaseConfigModel):
     vision: Optional[bool] = Field(
         False,
         description=("Enables vision support if the model supports it. (default: False)"),
+    )
+    warmup: Optional[bool] = Field(
+        False,
+        description=(
+            "Warm up the model after loading (default: False).\n"
+            "Runs a short schedule of forward passes so kernel compilation, autotuning\n"
+            "and CUDA graph capture happen at load time instead of on the first\n"
+            "requests. Adds some seconds to loading; sized from the cache, batch and\n"
+            "chunk settings in effect."
+        ),
     )
     vision_offload: Optional[bool] = Field(
         False,
@@ -419,19 +463,25 @@ class ModelConfig(BaseConfigModel):
         description=("DEPRECATED: Equivalent to template_vars_force: {enable_thinking: true}."),
     )
     reasoning: bool = Field(
-        False,
+        True,
         description=(
-            "Enable the reasoning parser (default: False).\n"
-            "Split response message into reasoning_content and content fields."
+            "Enable the reasoning parser (default: True).\n"
+            "Splits the response into reasoning_content and content fields. With the\n"
+            "tokens below left at auto, reasoning is only parsed when the model's\n"
+            "template or tokenizer shows which tags it uses."
         ),
     )
     reasoning_start_token: str = Field(
-        "<think>",
-        description="Start token for the reasoning parser (default: <think>).",
+        "auto",
+        description=(
+            "Start token for the reasoning parser (default: auto).\n"
+            "auto takes the tags from the detected tool format or the chat template;\n"
+            "set both tokens explicitly to override."
+        ),
     )
     reasoning_end_token: str = Field(
-        "</think>",
-        description="End token for the reasoning parser (default: </think>).",
+        "auto",
+        description="End token for the reasoning parser (default: auto).",
     )
     start_in_reasoning: str = Field(
         "auto",
@@ -474,10 +524,12 @@ class ModelConfig(BaseConfigModel):
         ),
     )
     tool_format: Optional[str] = Field(
-        None,
+        "auto",
         description=(
-            "Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank, \n"
-            "tool calls from the model will not be parsed by the server."
+            "Tool call format (default: auto). auto picks a parser from the model's\n"
+            "chat template, tokenizer and architecture, and warns if none matches.\n"
+            "Set a format name, e.g. 'qwen3_coder', to override; see the Tool Calling\n"
+            "docs for the supported formats. Leave blank to disable tool call parsing."
         ),
     )
     harmony: Optional[bool] = Field(
@@ -547,11 +599,13 @@ class DraftModelConfig(BaseConfigModel):
             "or auto-calculate."
         ),
     )
-    draft_cache_mode: Optional[CACHE_SIZES] = Field(
+    draft_cache_mode: Optional[CACHE_TYPE] = Field(
         "FP16",
         description=(
             "Cache mode for draft models to save VRAM (default: FP16).\n"
-            f"Possible values: {str(CACHE_SIZES)[15:-1]}."
+            "Specify the pair k_bits,v_bits where k_bits and v_bits "
+            "are integers from 2-8 (i.e. 8,8).\n"
+            f"The legacy values {str(CACHE_SIZES)[15:-1]} are also accepted."
         ),
     )
     draft_gpu_split: List[float] = Field(
