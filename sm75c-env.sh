@@ -10,10 +10,10 @@ export TORCH_EXTENSIONS_DIR=/home/pageai/.cache/exl3_sm75c_ext
 # 548dde0 = sm75-v150 merge of the kvsave workstream (P4 flip 2026-09-25).
 export EXL3_KVSAVE_REV=548dde0dd88cddf6e644d2073fc70e9488784527
 # per-venv rev stamp (venv-sm75-v150), written by the venv-install procedure:
-#   printf 'EXL3_KVSAVE_REV=%s\n' "$REV" > "$(dirname "${BASH_SOURCE[0]}")/.kvsave-rev-venv-sm75-v150.local"
+#   printf 'EXL3_KVSAVE_REV=%s\n' "${REV:?set REV to the installed engine rev}" > /home/pageai/tabbyAPI-v150/.kvsave-rev-venv-sm75-v150.local
 # SSOT = models-serve registry .env.EXL3_KVSAVE_REV (operationally binding).
 # Sourced AFTER the literal export above so a present stamp wins; absent stamp
 # = the committed literal pin (keep both in sync until the next venv install).
-_stamp="$(dirname "${BASH_SOURCE[0]}")/.kvsave-rev-venv-sm75-v150.local"
+_stamp="$(dirname "${BASH_SOURCE[0]:-$0}")/.kvsave-rev-venv-sm75-v150.local"
 if [ -f "$_stamp" ]; then . "$_stamp"; export EXL3_KVSAVE_REV; fi
 unset _stamp
