@@ -13,5 +13,6 @@ export EXL3_MOE_PINNED_ARENA=1
 # (no PYTHONPATH supersede needed since the recreate; re-stamped per commit;
 # 51dee15 prod base 2026-09-22 -> 8f9fdc0 P1 save/restore 2026-09-24 ->
 # e968676 rq_new_tokens requeue-accumulation fix 2026-09-24 ->
-# 500ce04 P2 save surface (delegates + save pass + zero-stash skip) 2026-09-24)
-export EXL3_KVSAVE_REV=500ce04eb71f395cf8ea6482760346a69cb4594c
+# 500ce04 P2 save surface (delegates + save pass + zero-stash skip) 2026-09-24 ->
+# c913ac7 P2 review-fix round 2026-09-25)
+export EXL3_KVSAVE_REV=c913ac7a82537395895cd57b22312df9f1da6caa
