@@ -1,6 +1,6 @@
 # Source before ANY venv-sm75-v150 python invocation (JIT build env for exllamav3-sm75 @ sm75-v150, v1.5.0 base)
 export CUDA_HOME=/usr/local/cuda-12.8
-export PATH="$HOME/tabbyAPI-v150/venv-sm75-v150/bin:/usr/local/cuda-12.8/bin:$PATH"
+export PATH="$HOME/tabbyAPI/venv-sm75-v150/bin:/usr/local/cuda-12.8/bin:$PATH"
 export CUDAHOSTCXX=/usr/bin/gcc-14
 export MAX_JOBS=16
 export TORCH_CUDA_ARCH_LIST="7.5;8.6"
@@ -10,7 +10,7 @@ export TORCH_EXTENSIONS_DIR=/home/pageai/.cache/exl3_sm75c_ext
 # 548dde0 = sm75-v150 merge of the kvsave workstream (P4 flip 2026-09-25).
 export EXL3_KVSAVE_REV=548dde0dd88cddf6e644d2073fc70e9488784527
 # per-venv rev stamp (venv-sm75-v150), written by the venv-install procedure:
-#   printf 'EXL3_KVSAVE_REV=%s\n' "${REV:?set REV to the installed engine rev}" > /home/pageai/tabbyAPI-v150/.kvsave-rev-venv-sm75-v150.local
+#   printf 'EXL3_KVSAVE_REV=%s\n' "${REV:?set REV to the installed engine rev}" > /home/pageai/tabbyAPI/.kvsave-rev-venv-sm75-v150.local
 # SSOT = models-serve registry .env.EXL3_KVSAVE_REV (operationally binding).
 # Sourced AFTER the literal export above so a present stamp wins; absent stamp
 # = the committed literal pin (keep both in sync until the next venv install).

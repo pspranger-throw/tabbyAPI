@@ -1,6 +1,6 @@
 # kvsave dev env — full 9-var per-id block (plan §3); only TORCH_EXTENSIONS_DIR differs from prod
 export CUDA_HOME=/usr/local/cuda-12.8
-export PATH="$HOME/tabbyAPI-v150/venv-kvsave/bin:/usr/local/cuda-12.8/bin:$PATH"
+export PATH="$HOME/tabbyAPI/venv-kvsave/bin:/usr/local/cuda-12.8/bin:$PATH"
 export CUDAHOSTCXX=/usr/bin/gcc-14
 export MAX_JOBS=16
 export TORCH_CUDA_ARCH_LIST="7.5;8.6"
@@ -17,7 +17,7 @@ export EXL3_MOE_PINNED_ARENA=1
 # c913ac7 P2 review-fix round 2026-09-25)
 export EXL3_KVSAVE_REV=c913ac7a82537395895cd57b22312df9f1da6caa
 # per-venv rev stamp (venv-kvsave), written by the venv-install procedure:
-#   printf 'EXL3_KVSAVE_REV=%s\n' "${REV:?set REV to the installed engine rev}" > /home/pageai/tabbyAPI-v150/.kvsave-rev-venv-kvsave.local
+#   printf 'EXL3_KVSAVE_REV=%s\n' "${REV:?set REV to the installed engine rev}" > /home/pageai/tabbyAPI/.kvsave-rev-venv-kvsave.local
 # SSOT = models-serve registry .env.EXL3_KVSAVE_REV (operationally binding).
 # Sourced AFTER the literal export above so a present stamp wins; absent stamp
 # = the committed literal pin (keep both in sync until the next venv install).
