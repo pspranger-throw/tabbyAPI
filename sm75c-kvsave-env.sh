@@ -1,6 +1,6 @@
 # kvsave dev env — full 9-var per-id block (plan §3); only TORCH_EXTENSIONS_DIR differs from prod
 export CUDA_HOME=/usr/local/cuda-12.8
-export PATH="$HOME/tabbyAPI-v150/venv-kvsave/bin:/usr/local/cuda-12.8/bin:$PATH"
+export PATH="$HOME/tabbyAPI/venv-kvsave/bin:/usr/local/cuda-12.8/bin:$PATH"
 export CUDAHOSTCXX=/usr/bin/gcc-14
 export MAX_JOBS=16
 export TORCH_CUDA_ARCH_LIST="7.5;8.6"
