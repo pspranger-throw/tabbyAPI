@@ -219,4 +219,9 @@ openapi.json
 
 # Local build venv (restructure B1 target location)
 venv-sm75-v150/
+venv-sm75-v154/
 venv-kvsave/
+
+# Bench/scratch shape configs (config-sc400-*.yml etc. — shapes live in the
+# models-serve per-id configs; these are derivation artifacts)
+config-*.yml
