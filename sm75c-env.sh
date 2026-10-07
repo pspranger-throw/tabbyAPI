@@ -9,3 +9,6 @@ export CUDAHOSTCXX=/usr/bin/gcc-14
 export MAX_JOBS=16
 export TORCH_CUDA_ARCH_LIST="7.5;8.6"
 export TORCH_EXTENSIONS_DIR=/home/pageai/.cache/exl3_sm75c_v154_ext
+
+# Explicit content-logging guard: DEBUG would dump full request params (model.py:1717) into console+logs sink — pin INFO.
+export TABBY_LOG_LEVEL=INFO
