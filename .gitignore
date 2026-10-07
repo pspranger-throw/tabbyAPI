@@ -225,3 +225,6 @@ venv-kvsave/
 # Bench/scratch shape configs (config-sc400-*.yml etc. — shapes live in the
 # models-serve per-id configs; these are derivation artifacts)
 config-*.yml
+
+# kvsave-era rev pins (per-venv; keep on disk, out of git — mechanism working, unported to v1.5.4)
+.kvsave-rev-*.local
