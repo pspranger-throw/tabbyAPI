@@ -311,6 +311,8 @@ class ExllamaV3Container:
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
         self.encode_cache = OrderedDict()
+        # PEFT LoRA adapters attached to the resident model (exllamav3 runtime LoRA)
+        self.loaded_loras = []
 
     # Required methods
     @classmethod
@@ -1052,20 +1054,78 @@ class ExllamaV3Container:
         while len(self.active_job_ids) > 0:
             await asyncio.sleep(0.01)
 
-    # TODO: Wire up exllamav3's LoRA support once the API surface for it is decided
+    # PEFT LoRA adapters, attached at runtime by exllamav3 (weights untouched)
     async def load_loras(self, lora_directory: pathlib.Path, **kwargs) -> Dict[str, List[str]]:
-        """Stub. LoRAs aren't hooked up to the ExLlamaV3 backend yet."""
+        """
+        Loads PEFT-format LoRA adapters onto the resident model.
 
-        xlogger.error("LoRA loading is not hooked up to the ExLlamaV3 backend yet.")
-        return {
-            "success": [],
-            "failure": [lora.get("name", "unknown") for lora in kwargs.get("loras", [])],
-        }
+        Each entry in ``loras`` names a directory under ``lora_directory`` that
+        holds adapter_config.json + adapter_model.safetensors. The adapter's
+        contribution is applied by exllamav3 on top of the dequantized output
+        of every target Linear layer, so quantized base weights are unchanged.
+
+        Args:
+            lora_directory: Parent directory that holds the adapter directories.
+            **kwargs: Tabby LoRA config (``loras``: [{name, scaling}]).
+
+        Returns:
+            Dict with ``success`` and ``failure`` name lists.
+        """
+
+        from exllamav3.model.lora import LoRA
+
+        result: Dict[str, List[str]] = {"success": [], "failure": []}
+        loras = kwargs.get("loras") or []
+
+        if self.model is None:
+            xlogger.error("Cannot load LoRAs before a model is loaded.")
+            result["failure"] = [lora.get("name", "unknown") for lora in loras]
+            return result
+
+        # Tabby semantics: load_loras replaces the active set
+        self._unload_loras()
+
+        base = pathlib.Path(lora_directory).resolve()
+        for lora in loras:
+            name = lora.get("name") if isinstance(lora, dict) else getattr(lora, "name", None)
+            scaling = lora.get("scaling", 1.0) if isinstance(lora, dict) else getattr(lora, "scaling", 1.0)
+            if not name:
+                result["failure"].append("unknown")
+                continue
+
+            adapter_path = (base / name).resolve()
+            if base not in adapter_path.parents:
+                xlogger.error(f"Refusing LoRA path outside the LoRA directory: {adapter_path}")
+                result["failure"].append(name)
+                continue
+
+            try:
+                lora_obj = LoRA.from_directory(self.model, str(adapter_path), scaling)
+                # Path is reported by /v1/lora and /v1/loras
+                lora_obj.lora_path = str(adapter_path)
+                self.loaded_loras.append(lora_obj)
+                result["success"].append(name)
+                xlogger.info(
+                    f"LoRA loaded: {name} (r={lora_obj.lora_r}, "
+                    f"alpha={lora_obj.lora_alpha:.0f}, scaling={scaling})"
+                )
+            except Exception as exc:
+                xlogger.error(f"Failed to load LoRA '{name}' from {adapter_path}: {exc}")
+                result["failure"].append(name)
+
+        return result
 
     def get_loras(self) -> List[Any]:
-        """Stub. LoRAs aren't hooked up to the ExLlamaV3 backend yet."""
+        """Returns the LoRA adapters currently attached to the model."""
 
-        return []
+        return list(self.loaded_loras)
+
+    def _unload_loras(self):
+        """Detaches every loaded adapter and releases its tensors."""
+
+        for lora in self.loaded_loras:
+            lora.unload()
+        self.loaded_loras = []
 
     async def load_gen(self, progress_callback=None, **kwargs):
         """
@@ -1360,9 +1420,9 @@ class ExllamaV3Container:
             **kwargs: Additional unloading options (e.g., shutdown).
         """
 
-        # Nothing to do for LoRA-only unloads until LoRAs are hooked up
+        # LoRA-only unloads detach the adapters; the model stays resident
         if loras_only:
-            xlogger.error("LoRA unloading is not hooked up to the ExLlamaV3 backend yet.")
+            self._unload_loras()
             return
 
         # Used when shutting down the server
@@ -1384,6 +1444,9 @@ class ExllamaV3Container:
             if self.generator is not None:
                 await self.generator.close()
                 self.generator = None
+
+            # Detach adapters before the model weights go away
+            self._unload_loras()
 
             self.model.unload()
             self.model = None
